@@ -19,3 +19,6 @@ Thumbs.db
 
 # Dev
 PROJECT_CONTEXT.md
+
+# Claude Code
+.claude/
