@@ -110,11 +110,6 @@ $(tail -80 "$SCRIPT_DIR/JOURNAL.md" 2>/dev/null || echo '_Файл не найд
 
 ---
 
-# Мои знания (KNOWLEDGE.md)
-$(cat "$SCRIPT_DIR/KNOWLEDGE.md" 2>/dev/null || echo '_Файл не найден._')
-
----
-
 # Входящие сообщения (INBOX.md)
 $(cat "$SCRIPT_DIR/INBOX.md" 2>/dev/null || echo '_Нет входящих._')
 
