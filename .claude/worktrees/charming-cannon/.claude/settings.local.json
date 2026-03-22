@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /d/YandexDisk/[ПРОЕКТЫ]/AI/anima-i -type f -name \"*.md\")",
+      "Bash(find /d/YandexDisk/[ПРОЕКТЫ]/AI/anima-i -type f -not -path '*/\\\\.*')",
+      "Bash(ls -la /d/YandexDisk/[ПРОЕКТЫ]/AI/anima-i/)",
+      "Bash(ls -la /d/YandexDisk/[ПРОЕКТЫ]/AI/anima-i/templates/scripts/)",
+      "Bash(ls -la /d/YandexDisk/[ПРОЕКТЫ]/AI/anima-i/auto_agent_cli/src/auto_agent/templates/scripts/)",
+      "Bash(ls -la /d/YandexDisk/[ПРОЕКТЫ]/AI/anima-i/generation_1/)",
+      "Bash(find /d/YandexDisk/[ПРОЕКТЫ]/AI/anima-i -name \"INBOX.md\" -o -name \"FAILURES.md\" -o -name \"MEMORY_ARCHIVE.md\")",
+      "Bash(grep -n \"INBOX\" /d/YandexDisk/[ПРОЕКТЫ]/AI/anima-i/README.md)",
+      "Bash(find /d/YandexDisk/[ПРОЕКТЫ]/AI/anima-i -type f \\\\\\( -name \"*.py\" -o -name \"*.service\" -o -name \"*.conf\" -o -name \"*requirements*\" \\\\\\))",
+      "Bash(find /d/YandexDisk/[ПРОЕКТЫ]/AI/anima-i -type d)"
+    ]
+  }
+}
