@@ -23,4 +23,5 @@ PROJECT_CONTEXT.md
 # Claude Code
 .claude/.generation_queue.json
 .generation_queue.json
+.generation_queue.lock
 .claude/

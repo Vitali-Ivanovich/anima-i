@@ -20,24 +20,33 @@ if [[ ! -f "$QUEUE_FILE" ]]; then
     echo '{"queue": []}' > "$QUEUE_FILE"
 fi
 
-# Добавляем новый элемент в очередь через Python
+# Добавляем новый элемент в очередь через Python (с file locking)
+LOCK_FILE="$SCRIPT_DIR/.generation_queue.lock"
 python3 << PYEOF
-import json, sys
+import json, fcntl
 
 queue_file = "$QUEUE_FILE"
-with open(queue_file, 'r') as f:
-    data = json.load(f)
+lock_file = "$LOCK_FILE"
 
-data['queue'].append({
-    "goal": """$GOAL""",
-    "source": "$SOURCE",
-    "status": "pending_approval",
-    "start_time": None,
-    "proposed_at": "$TIMESTAMP"
-})
+# File lock — защита от race condition с telegram_bot.py
+with open(lock_file, "a") as lock_fd:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        with open(queue_file, 'r') as f:
+            data = json.load(f)
 
-with open(queue_file, 'w') as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
+        data['queue'].append({
+            "goal": """$GOAL""",
+            "source": "$SOURCE",
+            "status": "pending_approval",
+            "start_time": None,
+            "proposed_at": "$TIMESTAMP"
+        })
+
+        with open(queue_file, 'w') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 print("✅ Цель добавлена в очередь")
 PYEOF

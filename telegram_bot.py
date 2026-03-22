@@ -15,6 +15,7 @@ telegram_bot.py — Telegram-бот для управления поколени
 """
 
 import os
+import fcntl
 import json
 import signal
 import asyncio
@@ -58,52 +59,97 @@ AUTO_APPROVE_TIMEOUT_HOURS = 24
 AWAIT_GOAL, AWAIT_TIME, AWAIT_TIME_VALUE, AWAIT_CONFIRM = range(4)
 
 
-# --- Утилиты очереди ---
+# --- Утилиты очереди (с file locking) ---
+
+QUEUE_LOCK_FILE = PROJECT_DIR / ".generation_queue.lock"
+
+
+def _locked_read_write(mutate_fn):
+    """Атомарная операция read-modify-write с file lock.
+
+    mutate_fn принимает data (dict) и возвращает результат (любой).
+    Файл блокируется на всё время операции — защита от race condition
+    с next_generation.sh и другими процессами.
+    """
+    QUEUE_LOCK_FILE.touch(exist_ok=True)
+    with open(QUEUE_LOCK_FILE, "r") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            # Читаем
+            if QUEUE_FILE.exists():
+                try:
+                    with open(QUEUE_FILE, "r") as f:
+                        data = json.load(f)
+                except (json.JSONDecodeError, Exception) as e:
+                    logger.error(f"Ошибка чтения очереди: {e}")
+                    data = {"queue": []}
+            else:
+                data = {"queue": []}
+
+            # Модифицируем
+            result = mutate_fn(data)
+
+            # Записываем
+            with open(QUEUE_FILE, "w") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+
+            return result
+        finally:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
 
 def read_queue() -> dict:
-    """Читает очередь поколений."""
-    if not QUEUE_FILE.exists():
-        return {"queue": []}
-    try:
-        with open(QUEUE_FILE, "r") as f:
-            return json.load(f)
-    except Exception as e:
-        logger.error(f"Ошибка чтения очереди: {e}")
-        return {"queue": []}
+    """Читает очередь поколений (с блокировкой)."""
+    return _locked_read_write(lambda data: dict(data))
 
 
-def write_queue(data: dict):
-    """Записывает очередь поколений."""
-    with open(QUEUE_FILE, "w") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+def claim_pending_item() -> dict | None:
+    """Атомарно находит pending_approval и меняет на awaiting_operator.
 
+    Объединяет get_pending_item + update_item_status в одну
+    атомарную операцию — исключает race condition.
+    """
+    result = {}
 
-def get_pending_item() -> dict | None:
-    """Возвращает первый элемент очереди со статусом pending_approval."""
-    data = read_queue()
-    for item in data["queue"]:
-        if item["status"] == "pending_approval":
-            return item
-    return None
+    def _claim(data):
+        for item in data["queue"]:
+            if item["status"] == "pending_approval":
+                item["status"] = "awaiting_operator"
+                result["item"] = dict(item)
+                return
+        result["item"] = None
+
+    _locked_read_write(_claim)
+    return result.get("item")
 
 
 def update_item_status(proposed_at: str, status: str, start_time: str = None):
-    """Обновляет статус элемента очереди."""
-    data = read_queue()
-    for item in data["queue"]:
-        if item["proposed_at"] == proposed_at:
-            item["status"] = status
-            if start_time:
-                item["start_time"] = start_time
-            break
-    write_queue(data)
+    """Обновляет статус элемента очереди (атомарно)."""
+    def _update(data):
+        for item in data["queue"]:
+            if item["proposed_at"] == proposed_at:
+                item["status"] = status
+                if start_time:
+                    item["start_time"] = start_time
+                break
+
+    _locked_read_write(_update)
+
+
+def add_queue_item(item: dict):
+    """Добавляет элемент в очередь (атомарно)."""
+    def _add(data):
+        data["queue"].append(item)
+
+    _locked_read_write(_add)
 
 
 def remove_item(proposed_at: str):
-    """Удаляет элемент из очереди."""
-    data = read_queue()
-    data["queue"] = [i for i in data["queue"] if i["proposed_at"] != proposed_at]
-    write_queue(data)
+    """Удаляет элемент из очереди (атомарно)."""
+    def _remove(data):
+        data["queue"][:] = [i for i in data["queue"] if i["proposed_at"] != proposed_at]
+
+    _locked_read_write(_remove)
 
 
 def get_next_generation_num() -> int:
@@ -183,28 +229,35 @@ async def start_generation(goal: str, generation_num: int, app: Application):
 async def check_queue(context: ContextTypes.DEFAULT_TYPE):
     """Проверяет очередь и инициирует согласование."""
     try:
-        item = get_pending_item()
-        if item:
-            source_label = "Мефодий" if item["source"] == "mefodiy" else "Оператор"
-            gen_num = get_next_generation_num()
+        # Атомарно: найти pending_approval → сменить на awaiting_operator
+        item = claim_pending_item()
 
-            keyboard = [["✅ Принять", "✏️ Изменить", "❌ Отклонить"]]
-            markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+        if item is None:
+            return
 
-            # Помечаем как отправленное чтобы не слать повторно
-            update_item_status(item["proposed_at"], "awaiting_operator")
+        logger.info(
+            f"check_queue: найден элемент proposed_at={item['proposed_at']}, "
+            f"source={item['source']}, статус сменён на awaiting_operator"
+        )
 
-            await context.bot.send_message(
-                chat_id=OPERATOR_CHAT_ID,
-                text=(
-                    f"🧠 *Предложение от {source_label}*\n\n"
-                    f"Цель поколения {gen_num}:\n\n"
-                    f"_{item['goal'][:500]}_\n\n"
-                    f"Принять, изменить или отклонить?"
-                ),
-                parse_mode="Markdown",
-                reply_markup=markup
-            )
+        source_label = "Мефодий" if item["source"] == "mefodiy" else "Оператор"
+        gen_num = get_next_generation_num()
+
+        keyboard = [["✅ Принять", "✏️ Изменить", "❌ Отклонить"]]
+        markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+
+        await context.bot.send_message(
+            chat_id=OPERATOR_CHAT_ID,
+            text=(
+                f"🧠 *Предложение от {source_label}*\n\n"
+                f"Цель поколения {gen_num}:\n\n"
+                f"_{item['goal'][:500]}_\n\n"
+                f"Принять, изменить или отклонить?"
+            ),
+            parse_mode="Markdown",
+            reply_markup=markup
+        )
+        logger.info(f"check_queue: предложение отправлено оператору")
     except Exception as e:
         logger.error(f"Ошибка проверки очереди: {e}")
 
@@ -366,17 +419,15 @@ async def confirm_and_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     source = context.user_data.get("pending_source", "operator")
     start_time = context.user_data.get("start_time")
 
-    # Добавляем в очередь
-    data = read_queue()
+    # Добавляем в очередь (атомарно)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    data["queue"].append({
+    add_queue_item({
         "goal": goal,
         "source": source,
-        "status": "approved" if start_time else "approved",
+        "status": "approved",
         "start_time": start_time,
         "proposed_at": timestamp
     })
-    write_queue(data)
 
     time_label = f"в {start_time}" if start_time else "сразу"
     await update.message.reply_text(
