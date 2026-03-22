@@ -24,9 +24,9 @@ if [[ ! -f "$SCRIPT_DIR/MAIN_GOAL.md" ]]; then
 fi
 
 # Подсчёт состояния TODO и INBOX
-TODO_OPEN_COUNT=$(grep -cE '^\s*-\s*\[\s\]\s+' "$SCRIPT_DIR/TODO.md" 2>/dev/null || echo 0)
-TODO_DONE_COUNT=$(grep -cE '^\s*-\s*\[[xX]\]\s+' "$SCRIPT_DIR/TODO.md" 2>/dev/null || echo 0)
-UNREAD_MESSAGE_COUNT=$(sed -n '/## Непрочитанные/,/^## /p' "$SCRIPT_DIR/INBOX.md" 2>/dev/null | grep -c '^### ' || echo 0)
+TODO_OPEN_COUNT=$(grep -cE '^\s*-\s*\[\s\]\s+' "$SCRIPT_DIR/TODO.md" 2>/dev/null; [ "${PIPESTATUS[0]}" -le 1 ] || true)
+TODO_DONE_COUNT=$(grep -cE '^\s*-\s*\[[xX]\]\s+' "$SCRIPT_DIR/TODO.md" 2>/dev/null; true)
+UNREAD_MESSAGE_COUNT=$(sed -n '/## Непрочитанные/,/^## /p' "$SCRIPT_DIR/INBOX.md" 2>/dev/null | grep -c '^### '; true)
 
 TODO_OPEN_COUNT=${TODO_OPEN_COUNT:-0}
 TODO_DONE_COUNT=${TODO_DONE_COUNT:-0}
