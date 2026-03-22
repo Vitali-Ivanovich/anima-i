@@ -51,6 +51,9 @@ QUEUE_FILE = PROJECT_DIR / ".generation_queue.json"
 # Интервал проверки очереди (секунды)
 QUEUE_CHECK_INTERVAL = 30
 
+# Таймаут автозапуска: если оператор не ответил на предложение — запустить автоматически
+AUTO_APPROVE_TIMEOUT_HOURS = 24
+
 # Состояния диалога
 AWAIT_GOAL, AWAIT_TIME, AWAIT_TIME_VALUE, AWAIT_CONFIRM = range(4)
 
@@ -478,7 +481,8 @@ async def watchdog(app: Application):
 # --- Планировщик запусков ---
 
 async def scheduler(app: Application):
-    """Проверяет запланированные запуски и стартует их вовремя."""
+    """Проверяет запланированные запуски и стартует их вовремя.
+    Также автоматически одобряет элементы awaiting_operator по таймауту."""
     while True:
         await asyncio.sleep(60)
         try:
@@ -486,17 +490,41 @@ async def scheduler(app: Application):
             now = datetime.now()
 
             for item in data["queue"]:
-                if item["status"] != "approved" or not item.get("start_time"):
-                    continue
-                try:
-                    start_dt = datetime.strptime(item["start_time"], "%Y-%m-%d %H:%M")
-                    if now >= start_dt:
-                        gen_num = get_next_generation_num()
-                        remove_item(item["proposed_at"])
-                        await start_generation(item["goal"], gen_num, app)
-                        logger.info(f"Планировщик запустил поколение {gen_num}")
-                except ValueError:
-                    pass
+                # Запланированные запуски — по времени
+                if item["status"] == "approved" and item.get("start_time"):
+                    try:
+                        start_dt = datetime.strptime(item["start_time"], "%Y-%m-%d %H:%M")
+                        if now >= start_dt:
+                            gen_num = get_next_generation_num()
+                            remove_item(item["proposed_at"])
+                            await start_generation(item["goal"], gen_num, app)
+                            logger.info(f"Планировщик запустил поколение {gen_num}")
+                    except ValueError:
+                        pass
+
+                # Автозапуск по таймауту — оператор не ответил
+                if item["status"] == "awaiting_operator":
+                    try:
+                        proposed_dt = datetime.strptime(item["proposed_at"], "%Y-%m-%d %H:%M:%S")
+                        elapsed = now - proposed_dt
+                        if elapsed >= timedelta(hours=AUTO_APPROVE_TIMEOUT_HOURS):
+                            gen_num = get_next_generation_num()
+                            logger.info(
+                                f"Автозапуск по таймауту ({AUTO_APPROVE_TIMEOUT_HOURS}ч): "
+                                f"поколение {gen_num}"
+                            )
+                            await app.bot.send_message(
+                                chat_id=OPERATOR_CHAT_ID,
+                                text=(
+                                    f"⏰ {AUTO_APPROVE_TIMEOUT_HOURS} часов без ответа — "
+                                    f"запускаю поколение {gen_num} автоматически"
+                                ),
+                                reply_markup=ReplyKeyboardRemove()
+                            )
+                            remove_item(item["proposed_at"])
+                            await start_generation(item["goal"], gen_num, app)
+                    except ValueError:
+                        pass
         except Exception as e:
             logger.error(f"Планировщик ошибка: {e}")
 
