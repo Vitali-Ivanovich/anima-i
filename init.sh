@@ -28,7 +28,7 @@ for f in "${TEMPLATE_FILES[@]}"; do
 done
 
 # Копируем скрипты
-SCRIPT_FILES=("run.sh" "think.sh" "loop.sh" "health_check.sh" "publish_telegram.sh")
+SCRIPT_FILES=("run.sh" "think.sh" "loop.sh" "health_check.sh" "publish_telegram.sh" "generate_image.sh" "set_channel_photo.sh")
 for f in "${SCRIPT_FILES[@]}"; do
     if [[ -f "$TARGET_DIR/$f" ]]; then
         echo "  ⏭  $f — уже существует, пропускаю"
