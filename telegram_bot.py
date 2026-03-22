@@ -16,8 +16,8 @@ telegram_bot.py — Telegram-бот для управления поколени
 
 import os
 import json
+import signal
 import asyncio
-import subprocess
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -124,42 +124,51 @@ def get_current_generation_dir() -> Path | None:
     return existing[-1] if existing else None
 
 
-def is_generation_running() -> bool:
-    """Проверяет запущен ли сейчас loop.sh."""
-    result = subprocess.run(
-        ["pgrep", "-f", "loop.sh"],
-        capture_output=True
+async def is_generation_running() -> bool:
+    """Проверяет запущен ли сейчас loop.sh (неблокирующий)."""
+    proc = await asyncio.create_subprocess_exec(
+        "pgrep", "-f", "loop.sh",
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL
     )
-    return result.returncode == 0
+    returncode = await proc.wait()
+    return returncode == 0
 
 
 # --- Запуск поколения ---
 
 async def start_generation(goal: str, generation_num: int, app: Application):
-    """Инициализирует и запускает новое поколение."""
+    """Инициализирует и запускает новое поколение (неблокирующий)."""
     gen_dir = PROJECT_DIR / f"generation_{generation_num}"
     logger.info(f"Запуск поколения {generation_num}")
 
-    # Инициализация через init.sh
-    subprocess.run(
-        ["bash", str(PROJECT_DIR / "init.sh"), str(gen_dir)],
-        cwd=str(PROJECT_DIR)
+    # Инициализация через init.sh (неблокирующий)
+    proc = await asyncio.create_subprocess_exec(
+        "bash", str(PROJECT_DIR / "init.sh"), str(gen_dir),
+        cwd=str(PROJECT_DIR),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
     )
+    stdout, stderr = await proc.communicate()
+    if proc.returncode != 0:
+        logger.error(f"init.sh завершился с ошибкой: {stderr.decode()}")
+        return
 
     # Записываем цель
     (gen_dir / "MAIN_GOAL.md").write_text(f"# Main Goal\n\n{goal}\n")
 
-    # Запускаем loop.sh в фоне
+    # Запускаем loop.sh в фоне (detached — не ждём завершения)
     log_file = gen_dir / ".runtime" / "loop.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
-    subprocess.Popen(
-        ["bash", "loop.sh"],
-        cwd=str(gen_dir),
-        stdout=open(log_file, "w"),
-        stderr=subprocess.STDOUT,
-        start_new_session=True
-    )
+    with open(log_file, "w") as lf:
+        await asyncio.create_subprocess_exec(
+            "bash", "loop.sh",
+            cwd=str(gen_dir),
+            stdout=lf,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True
+        )
 
     logger.info(f"Поколение {generation_num} запущено")
     await app.bot.send_message(
@@ -169,38 +178,35 @@ async def start_generation(goal: str, generation_num: int, app: Application):
     )
 
 
-# --- Polling очереди ---
+# --- Фоновые задачи (callbacks для job_queue) ---
 
-async def check_queue(app: Application):
-    """Периодически проверяет очередь и инициирует согласование."""
-    while True:
-        try:
-            item = get_pending_item()
-            if item:
-                source_label = "Мефодий" if item["source"] == "mefodiy" else "Оператор"
-                gen_num = get_next_generation_num()
+async def check_queue(context: ContextTypes.DEFAULT_TYPE):
+    """Проверяет очередь и инициирует согласование."""
+    try:
+        item = get_pending_item()
+        if item:
+            source_label = "Мефодий" if item["source"] == "mefodiy" else "Оператор"
+            gen_num = get_next_generation_num()
 
-                keyboard = [["✅ Принять", "✏️ Изменить", "❌ Отклонить"]]
-                markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+            keyboard = [["✅ Принять", "✏️ Изменить", "❌ Отклонить"]]
+            markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
 
-                # Помечаем как отправленное чтобы не слать повторно
-                update_item_status(item["proposed_at"], "awaiting_operator")
+            # Помечаем как отправленное чтобы не слать повторно
+            update_item_status(item["proposed_at"], "awaiting_operator")
 
-                await app.bot.send_message(
-                    chat_id=OPERATOR_CHAT_ID,
-                    text=(
-                        f"🧠 *Предложение от {source_label}*\n\n"
-                        f"Цель поколения {gen_num}:\n\n"
-                        f"_{item['goal'][:500]}_\n\n"
-                        f"Принять, изменить или отклонить?"
-                    ),
-                    parse_mode="Markdown",
-                    reply_markup=markup
-                )
-        except Exception as e:
-            logger.error(f"Ошибка проверки очереди: {e}")
-
-        await asyncio.sleep(QUEUE_CHECK_INTERVAL)
+            await context.bot.send_message(
+                chat_id=OPERATOR_CHAT_ID,
+                text=(
+                    f"🧠 *Предложение от {source_label}*\n\n"
+                    f"Цель поколения {gen_num}:\n\n"
+                    f"_{item['goal'][:500]}_\n\n"
+                    f"Принять, изменить или отклонить?"
+                ),
+                parse_mode="Markdown",
+                reply_markup=markup
+            )
+    except Exception as e:
+        logger.error(f"Ошибка проверки очереди: {e}")
 
 
 # --- Обработчики команд ---
@@ -237,7 +243,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     open_tasks = todo_text.count("- [ ]")
     done_tasks = todo_text.count("- [x]")
 
-    running = "🟢 запущено" if is_generation_running() else "🔴 остановлено"
+    running = "🟢 запущено" if await is_generation_running() else "🔴 остановлено"
 
     await update.message.reply_text(
         f"📊 *Поколение {gen_num}* — {running}\n\n"
@@ -382,7 +388,7 @@ async def confirm_and_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not start_time:
         gen_num = get_next_generation_num()
         remove_item(timestamp)
-        await start_generation(goal, gen_num, update.get_bot() or context.application)
+        await start_generation(goal, gen_num, context.application)
 
     return ConversationHandler.END
 
@@ -438,100 +444,117 @@ async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
-# --- Watchdog для loop.sh ---
-
-async def watchdog(app: Application):
+async def watchdog(context: ContextTypes.DEFAULT_TYPE):
     """
     Проверяет не завис ли текущий цикл агента.
     Если loop.sh не запущен а поколение не завершено — рестартует.
     """
-    while True:
-        await asyncio.sleep(300)  # проверяем каждые 5 минут
-        try:
-            gen_dir = get_current_generation_dir()
-            if not gen_dir:
-                continue
+    try:
+        gen_dir = get_current_generation_dir()
+        if not gen_dir:
+            return
 
-            # Если loop.sh не запущен
-            if is_generation_running():
-                continue
+        if await is_generation_running():
+            return
 
-            # Проверяем есть ли незакрытые задачи
-            todo_text = (gen_dir / "TODO.md").read_text() if (gen_dir / "TODO.md").exists() else ""
-            open_tasks = todo_text.count("- [ ]")
+        # Проверяем есть ли незакрытые задачи
+        todo_text = (gen_dir / "TODO.md").read_text() if (gen_dir / "TODO.md").exists() else ""
+        open_tasks = todo_text.count("- [ ]")
 
-            if open_tasks > 0:
-                logger.warning("Watchdog: loop.sh не запущен, есть открытые задачи — рестарт")
-                log_file = gen_dir / ".runtime" / "loop.log"
-                subprocess.Popen(
-                    ["bash", "loop.sh"],
+        if open_tasks > 0:
+            logger.warning("Watchdog: loop.sh не запущен, есть открытые задачи — рестарт")
+            log_file = gen_dir / ".runtime" / "loop.log"
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+
+            with open(log_file, "a") as lf:
+                await asyncio.create_subprocess_exec(
+                    "bash", "loop.sh",
                     cwd=str(gen_dir),
-                    stdout=open(log_file, "a"),
-                    stderr=subprocess.STDOUT,
+                    stdout=lf,
+                    stderr=asyncio.subprocess.STDOUT,
                     start_new_session=True
                 )
-                await app.bot.send_message(
-                    chat_id=OPERATOR_CHAT_ID,
-                    text="⚠️ Watchdog: Мефодий завис, перезапустил цикл."
-                )
-        except Exception as e:
-            logger.error(f"Watchdog ошибка: {e}")
+
+            await context.bot.send_message(
+                chat_id=OPERATOR_CHAT_ID,
+                text="⚠️ Watchdog: Мефодий завис, перезапустил цикл."
+            )
+    except Exception as e:
+        logger.error(f"Watchdog ошибка: {e}")
 
 
 # --- Планировщик запусков ---
 
-async def scheduler(app: Application):
+async def scheduler(context: ContextTypes.DEFAULT_TYPE):
     """Проверяет запланированные запуски и стартует их вовремя.
     Также автоматически одобряет элементы awaiting_operator по таймауту."""
-    while True:
-        await asyncio.sleep(60)
-        try:
-            data = read_queue()
-            now = datetime.now()
+    try:
+        data = read_queue()
+        now = datetime.now()
 
-            for item in data["queue"]:
-                # Запланированные запуски — по времени
-                if item["status"] == "approved" and item.get("start_time"):
-                    try:
-                        start_dt = datetime.strptime(item["start_time"], "%Y-%m-%d %H:%M")
-                        if now >= start_dt:
-                            gen_num = get_next_generation_num()
-                            remove_item(item["proposed_at"])
-                            await start_generation(item["goal"], gen_num, app)
-                            logger.info(f"Планировщик запустил поколение {gen_num}")
-                    except ValueError:
-                        pass
+        for item in data["queue"]:
+            # Запланированные запуски — по времени
+            if item["status"] == "approved" and item.get("start_time"):
+                try:
+                    start_dt = datetime.strptime(item["start_time"], "%Y-%m-%d %H:%M")
+                    if now >= start_dt:
+                        gen_num = get_next_generation_num()
+                        remove_item(item["proposed_at"])
+                        await start_generation(item["goal"], gen_num, context.application)
+                        logger.info(f"Планировщик запустил поколение {gen_num}")
+                except ValueError:
+                    pass
 
-                # Автозапуск по таймауту — оператор не ответил
-                if item["status"] == "awaiting_operator":
-                    try:
-                        proposed_dt = datetime.strptime(item["proposed_at"], "%Y-%m-%d %H:%M:%S")
-                        elapsed = now - proposed_dt
-                        if elapsed >= timedelta(hours=AUTO_APPROVE_TIMEOUT_HOURS):
-                            gen_num = get_next_generation_num()
-                            logger.info(
-                                f"Автозапуск по таймауту ({AUTO_APPROVE_TIMEOUT_HOURS}ч): "
-                                f"поколение {gen_num}"
-                            )
-                            await app.bot.send_message(
-                                chat_id=OPERATOR_CHAT_ID,
-                                text=(
-                                    f"⏰ {AUTO_APPROVE_TIMEOUT_HOURS} часов без ответа — "
-                                    f"запускаю поколение {gen_num} автоматически"
-                                ),
-                                reply_markup=ReplyKeyboardRemove()
-                            )
-                            remove_item(item["proposed_at"])
-                            await start_generation(item["goal"], gen_num, app)
-                    except ValueError:
-                        pass
-        except Exception as e:
-            logger.error(f"Планировщик ошибка: {e}")
+            # Автозапуск по таймауту — оператор не ответил
+            if item["status"] == "awaiting_operator":
+                try:
+                    proposed_dt = datetime.strptime(item["proposed_at"], "%Y-%m-%d %H:%M:%S")
+                    elapsed = now - proposed_dt
+                    if elapsed >= timedelta(hours=AUTO_APPROVE_TIMEOUT_HOURS):
+                        gen_num = get_next_generation_num()
+                        logger.info(
+                            f"Автозапуск по таймауту ({AUTO_APPROVE_TIMEOUT_HOURS}ч): "
+                            f"поколение {gen_num}"
+                        )
+                        await context.bot.send_message(
+                            chat_id=OPERATOR_CHAT_ID,
+                            text=(
+                                f"⏰ {AUTO_APPROVE_TIMEOUT_HOURS} часов без ответа — "
+                                f"запускаю поколение {gen_num} автоматически"
+                            ),
+                            reply_markup=ReplyKeyboardRemove()
+                        )
+                        remove_item(item["proposed_at"])
+                        await start_generation(item["goal"], gen_num, context.application)
+                except ValueError:
+                    pass
+    except Exception as e:
+        logger.error(f"Планировщик ошибка: {e}")
+
+
+async def post_init(app: Application):
+    """Регистрация фоновых задач после инициализации приложения."""
+    app.job_queue.run_repeating(check_queue, interval=QUEUE_CHECK_INTERVAL, first=10)
+    app.job_queue.run_repeating(scheduler, interval=60, first=15)
+    app.job_queue.run_repeating(watchdog, interval=300, first=30)
+    logger.info("Фоновые задачи зарегистрированы")
+
+
+async def post_shutdown(app: Application):
+    """Cleanup при остановке."""
+    logger.info("Бот остановлен")
 
 
 def main():
     request = HTTPXRequest(read_timeout=30, connect_timeout=30, write_timeout=30)
-    app = Application.builder().token(BOT_TOKEN).request(request).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .request(request)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
 
     # Conversation handler
     conv_handler = ConversationHandler(
@@ -555,22 +578,13 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("queue", cmd_queue))
 
-    # Фоновые задачи
-    app.job_queue.run_repeating(
-        lambda ctx: asyncio.ensure_future(check_queue(app)),
-        interval=QUEUE_CHECK_INTERVAL,
-        first=10
-    )
-    app.job_queue.run_repeating(
-        lambda ctx: asyncio.ensure_future(scheduler(app)),
-        interval=60,
-        first=15
-    )
-    app.job_queue.run_repeating(
-        lambda ctx: asyncio.ensure_future(watchdog(app)),
-        interval=300,
-        first=30
-    )
+    # Graceful shutdown по SIGTERM (systemd)
+    def handle_sigterm(signum, frame):
+        logger.info("Получен SIGTERM, останавливаюсь...")
+        # run_polling слушает asyncio signals, но SIGTERM нужно пробросить
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGTERM, handle_sigterm)
 
     logger.info("Мефодий-бот запущен. Слушаю оператора...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
