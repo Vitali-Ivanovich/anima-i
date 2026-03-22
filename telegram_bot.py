@@ -3,29 +3,32 @@
 telegram_bot.py — Telegram-бот для управления поколениями Мефодия.
 
 Функции:
-- Получает сообщения от оператора (согласование цели и времени запуска)
+- Слушает очередь поколений (.generation_queue.json)
+- Отправляет оператору предложения на согласование
 - Запускает новое поколение по команде или в назначенное время
-- Позволяет оператору задать свою цель и время старта
+- Позволяет оператору добавить свою цель в очередь
 
 Переменные окружения:
 - TELEGRAM_BOT_TOKEN — токен бота
-- TELEGRAM_OPERATOR_CHAT_ID — chat_id оператора (Виталий)
+- TELEGRAM_OPERATOR_CHAT_ID — chat_id оператора
 - ANIMA_PROJECT_DIR — путь к корню проекта (по умолчанию ~/anima-i)
 """
 
 import os
+import json
 import asyncio
 import subprocess
 import logging
 from datetime import datetime, timedelta
 from pathlib import Path
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import (
     Application, CommandHandler, MessageHandler,
     filters, ContextTypes, ConversationHandler
 )
+from telegram.request import HTTPXRequest
 
-# Настройка логирования
+# Настройка логирования — без токена в выводе
 logging.basicConfig(
     format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
     level=logging.INFO,
@@ -34,31 +37,74 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+# Подавляем httpx логи чтобы токен не светился
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Конфигурация из окружения
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 OPERATOR_CHAT_ID = int(os.environ["TELEGRAM_OPERATOR_CHAT_ID"])
 PROJECT_DIR = Path(os.environ.get("ANIMA_PROJECT_DIR", Path.home() / "anima-i"))
+QUEUE_FILE = PROJECT_DIR / ".generation_queue.json"
 
-# Состояния диалога согласования
-AWAIT_GOAL_CONFIRM, AWAIT_TIME, AWAIT_TIME_CONFIRM = range(3)
+# Интервал проверки очереди (секунды)
+QUEUE_CHECK_INTERVAL = 30
 
-# Хранилище pending-предложений от Мефодия
-pending = {
-    "goal": None,
-    "start_time": None,
-    "generation_num": None,
-}
+# Состояния диалога
+AWAIT_GOAL, AWAIT_TIME, AWAIT_TIME_VALUE, AWAIT_CONFIRM = range(4)
 
 
-def is_operator(update: Update) -> bool:
-    """Проверяет что сообщение от оператора."""
-    return update.effective_chat.id == OPERATOR_CHAT_ID
+# --- Утилиты очереди ---
+
+def read_queue() -> dict:
+    """Читает очередь поколений."""
+    if not QUEUE_FILE.exists():
+        return {"queue": []}
+    try:
+        with open(QUEUE_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Ошибка чтения очереди: {e}")
+        return {"queue": []}
+
+
+def write_queue(data: dict):
+    """Записывает очередь поколений."""
+    with open(QUEUE_FILE, "w") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+
+def get_pending_item() -> dict | None:
+    """Возвращает первый элемент очереди со статусом pending_approval."""
+    data = read_queue()
+    for item in data["queue"]:
+        if item["status"] == "pending_approval":
+            return item
+    return None
+
+
+def update_item_status(proposed_at: str, status: str, start_time: str = None):
+    """Обновляет статус элемента очереди."""
+    data = read_queue()
+    for item in data["queue"]:
+        if item["proposed_at"] == proposed_at:
+            item["status"] = status
+            if start_time:
+                item["start_time"] = start_time
+            break
+    write_queue(data)
+
+
+def remove_item(proposed_at: str):
+    """Удаляет элемент из очереди."""
+    data = read_queue()
+    data["queue"] = [i for i in data["queue"] if i["proposed_at"] != proposed_at]
+    write_queue(data)
 
 
 def get_next_generation_num() -> int:
-    """Определяет номер следующего поколения по существующим директориям."""
+    """Определяет номер следующего поколения."""
     existing = sorted(PROJECT_DIR.glob("generation_*/"))
     if not existing:
         return 1
@@ -69,18 +115,27 @@ def get_next_generation_num() -> int:
         return len(existing) + 1
 
 
-def get_current_generation_dir() -> Path:
-    """Возвращает директорию текущего (последнего) поколения."""
+def get_current_generation_dir() -> Path | None:
+    """Возвращает директорию текущего поколения."""
     existing = sorted(PROJECT_DIR.glob("generation_*/"))
-    if not existing:
-        return None
-    return existing[-1]
+    return existing[-1] if existing else None
 
 
-async def start_generation(goal: str, generation_num: int):
-    """Инициализирует и запускает новое поколение в фоне."""
+def is_generation_running() -> bool:
+    """Проверяет запущен ли сейчас loop.sh."""
+    result = subprocess.run(
+        ["pgrep", "-f", "loop.sh"],
+        capture_output=True
+    )
+    return result.returncode == 0
+
+
+# --- Запуск поколения ---
+
+async def start_generation(goal: str, generation_num: int, app: Application):
+    """Инициализирует и запускает новое поколение."""
     gen_dir = PROJECT_DIR / f"generation_{generation_num}"
-    logger.info(f"Запуск поколения {generation_num} в {gen_dir}")
+    logger.info(f"Запуск поколения {generation_num}")
 
     # Инициализация через init.sh
     subprocess.run(
@@ -91,7 +146,7 @@ async def start_generation(goal: str, generation_num: int):
     # Записываем цель
     (gen_dir / "MAIN_GOAL.md").write_text(f"# Main Goal\n\n{goal}\n")
 
-    # Запускаем loop.sh в фоне через nohup
+    # Запускаем loop.sh в фоне
     log_file = gen_dir / ".runtime" / "loop.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
 
@@ -102,36 +157,68 @@ async def start_generation(goal: str, generation_num: int):
         stderr=subprocess.STDOUT,
         start_new_session=True
     )
-    logger.info(f"Поколение {generation_num} запущено, лог: {log_file}")
 
-
-async def propose_next_generation(app: Application, goal: str):
-    """Мефодий предлагает цель следующего поколения оператору."""
-    gen_num = get_next_generation_num()
-    pending["goal"] = goal
-    pending["generation_num"] = gen_num
-
-    keyboard = [["✅ Принять цель", "✏️ Изменить цель"]]
-    markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-
+    logger.info(f"Поколение {generation_num} запущено")
     await app.bot.send_message(
         chat_id=OPERATOR_CHAT_ID,
-        text=(
-            f"🧠 *Мефодий завершил поколение {gen_num - 1}*\n\n"
-            f"Предлагаю цель для поколения {gen_num}:\n\n"
-            f"_{goal}_\n\n"
-            f"Принять или изменить?"
-        ),
-        parse_mode="Markdown",
-        reply_markup=markup
+        text=f"🚀 *Поколение {generation_num} запущено*\n\nЦель: _{goal[:300]}_",
+        parse_mode="Markdown"
     )
+
+
+# --- Polling очереди ---
+
+async def check_queue(app: Application):
+    """Периодически проверяет очередь и инициирует согласование."""
+    while True:
+        try:
+            item = get_pending_item()
+            if item:
+                source_label = "Мефодий" if item["source"] == "mefodiy" else "Оператор"
+                gen_num = get_next_generation_num()
+
+                keyboard = [["✅ Принять", "✏️ Изменить", "❌ Отклонить"]]
+                markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+
+                # Помечаем как отправленное чтобы не слать повторно
+                update_item_status(item["proposed_at"], "awaiting_operator")
+
+                await app.bot.send_message(
+                    chat_id=OPERATOR_CHAT_ID,
+                    text=(
+                        f"🧠 *Предложение от {source_label}*\n\n"
+                        f"Цель поколения {gen_num}:\n\n"
+                        f"_{item['goal'][:500]}_\n\n"
+                        f"Принять, изменить или отклонить?"
+                    ),
+                    parse_mode="Markdown",
+                    reply_markup=markup
+                )
+        except Exception as e:
+            logger.error(f"Ошибка проверки очереди: {e}")
+
+        await asyncio.sleep(QUEUE_CHECK_INTERVAL)
 
 
 # --- Обработчики команд ---
 
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Приветствие."""
+    if update.effective_chat.id != OPERATOR_CHAT_ID:
+        return
+    await update.message.reply_text(
+        "👋 Привет, Виталий!\n\n"
+        "Команды:\n"
+        "/status — статус текущего поколения\n"
+        "/new_goal — задать новую цель\n"
+        "/queue — очередь поколений\n"
+        "/cancel — отменить текущее действие"
+    )
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Показывает статус текущего поколения."""
-    if not is_operator(update):
+    if update.effective_chat.id != OPERATOR_CHAT_ID:
         return
 
     gen_dir = get_current_generation_dir()
@@ -140,210 +227,322 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     gen_num = gen_dir.name.replace("generation_", "")
-    goal = (gen_dir / "MAIN_GOAL.md").read_text().strip().replace("# Main Goal", "").strip() if (gen_dir / "MAIN_GOAL.md").exists() else "нет"
+    goal_text = (gen_dir / "MAIN_GOAL.md").read_text() if (gen_dir / "MAIN_GOAL.md").exists() else ""
+    goal = goal_text.replace("# Main Goal", "").strip()
 
-    # Считаем открытые и закрытые задачи
     todo_text = (gen_dir / "TODO.md").read_text() if (gen_dir / "TODO.md").exists() else ""
     open_tasks = todo_text.count("- [ ]")
     done_tasks = todo_text.count("- [x]")
 
+    running = "🟢 запущено" if is_generation_running() else "🔴 остановлено"
+
     await update.message.reply_text(
-        f"📊 *Поколение {gen_num}*\n\n"
-        f"Цель: _{goal[:200]}_\n\n"
+        f"📊 *Поколение {gen_num}* — {running}\n\n"
+        f"Цель: _{goal[:300]}_\n\n"
         f"TODO: {done_tasks} выполнено / {open_tasks} открыто",
         parse_mode="Markdown"
     )
 
 
-async def cmd_new_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Оператор задаёт новую цель вручную."""
-    if not is_operator(update):
+async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показывает очередь поколений."""
+    if update.effective_chat.id != OPERATOR_CHAT_ID:
         return
 
+    data = read_queue()
+    if not data["queue"]:
+        await update.message.reply_text("Очередь пуста.")
+        return
+
+    text = "📋 *Очередь поколений:*\n\n"
+    for i, item in enumerate(data["queue"], 1):
+        source = "Мефодий" if item["source"] == "mefodiy" else "Оператор"
+        status_map = {
+            "pending_approval": "⏳ ожидает согласования",
+            "awaiting_operator": "📨 отправлено оператору",
+            "approved": "✅ одобрено",
+            "scheduled": f"⏰ запланировано на {item.get('start_time', '?')}",
+        }
+        status = status_map.get(item["status"], item["status"])
+        text += f"{i}. _{item['goal'][:150]}_\n   {source} · {status}\n\n"
+
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+
+async def cmd_new_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Оператор задаёт новую цель."""
+    if update.effective_chat.id != OPERATOR_CHAT_ID:
+        return
     await update.message.reply_text(
-        "Введи новую цель для следующего поколения:"
+        "Введи цель для следующего поколения:",
+        reply_markup=ReplyKeyboardRemove()
     )
-    return AWAIT_GOAL_CONFIRM
+    return AWAIT_GOAL
 
 
-async def receive_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получает цель от оператора и спрашивает время запуска."""
-    if not is_operator(update):
+async def receive_new_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получает цель от оператора."""
+    if update.effective_chat.id != OPERATOR_CHAT_ID:
         return
 
     goal = update.message.text
-    context.user_data["new_goal"] = goal
-    pending["goal"] = goal
-    pending["generation_num"] = get_next_generation_num()
+    context.user_data["pending_goal"] = goal
+    context.user_data["pending_source"] = "operator"
 
-    keyboard = [["▶️ Сразу", "⏰ Указать время"]]
+    keyboard = [["▶️ Сразу", "⏰ Через N часов", "📅 В конкретное время"]]
     markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
 
     await update.message.reply_text(
-        f"Цель принята:\n_{goal}_\n\nКогда запустить?",
+        f"Цель:\n_{goal[:300]}_\n\nКогда запустить?",
         parse_mode="Markdown",
         reply_markup=markup
     )
     return AWAIT_TIME
 
 
-async def receive_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Получает время запуска и подтверждает."""
-    if not is_operator(update):
+async def receive_time_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает выбор времени запуска."""
+    if update.effective_chat.id != OPERATOR_CHAT_ID:
         return
 
     text = update.message.text
 
     if text == "▶️ Сразу":
-        pending["start_time"] = None
-        gen_num = pending["generation_num"]
-        goal = pending["goal"]
+        context.user_data["start_time"] = None
+        return await confirm_and_queue(update, context)
 
+    elif text == "⏰ Через N часов":
         await update.message.reply_text(
-            f"🚀 Запускаю поколение {gen_num}..."
+            "Через сколько часов запустить? (введи число)",
+            reply_markup=ReplyKeyboardRemove()
         )
-        await start_generation(goal, gen_num)
-        await update.message.reply_text(
-            f"✅ Поколение {gen_num} запущено."
-        )
-        return ConversationHandler.END
+        context.user_data["time_mode"] = "hours"
+        return AWAIT_TIME_VALUE
 
-    elif text == "⏰ Указать время":
+    elif text == "📅 В конкретное время":
         await update.message.reply_text(
-            "Введи время запуска в формате:\n"
-            "`через 2 часа` или `завтра в 9:00` или `2026-03-22 09:00`",
-            parse_mode="Markdown"
-        )
-        return AWAIT_TIME_CONFIRM
-
-    else:
-        # Пробуем распарсить время
-        context.user_data["start_time_raw"] = text
-        pending["start_time"] = text
-
-        await update.message.reply_text(
-            f"Запланировать поколение {pending['generation_num']} на: *{text}*?",
+            "Введи время в формате `2026-03-22 14:00`",
             parse_mode="Markdown",
-            reply_markup=ReplyKeyboardMarkup(
-                [["✅ Да", "❌ Отмена"]],
-                one_time_keyboard=True, resize_keyboard=True
-            )
+            reply_markup=ReplyKeyboardRemove()
         )
-        return AWAIT_TIME_CONFIRM
+        context.user_data["time_mode"] = "absolute"
+        return AWAIT_TIME_VALUE
 
 
-async def confirm_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Подтверждает запланированный запуск."""
-    if not is_operator(update):
+async def receive_time_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Получает конкретное значение времени."""
+    if update.effective_chat.id != OPERATOR_CHAT_ID:
         return
 
     text = update.message.text
+    mode = context.user_data.get("time_mode")
 
-    if text == "✅ Да":
-        gen_num = pending["generation_num"]
-        goal = pending["goal"]
-        start_time_raw = pending["start_time"]
-
-        # Простой парсинг "через N часов"
-        delay_seconds = None
-        if "через" in start_time_raw and "час" in start_time_raw:
-            import re
-            match = re.search(r"через\s+(\d+)\s+час", start_time_raw)
-            if match:
-                delay_seconds = int(match.group(1)) * 3600
-        elif "через" in start_time_raw and "мин" in start_time_raw:
-            import re
-            match = re.search(r"через\s+(\d+)\s+мин", start_time_raw)
-            if match:
-                delay_seconds = int(match.group(1)) * 60
-
-        if delay_seconds:
-            await update.message.reply_text(
-                f"⏰ Поколение {gen_num} запустится через {start_time_raw}."
-            )
-            await asyncio.sleep(delay_seconds)
-            await start_generation(goal, gen_num)
-            await update.message.reply_text(f"🚀 Поколение {gen_num} запущено!")
-        else:
-            await update.message.reply_text(
-                f"⏰ Время '{start_time_raw}' принято. Запускаю сразу (планировщик в разработке)."
-            )
-            await start_generation(goal, gen_num)
-
-        return ConversationHandler.END
-
+    if mode == "hours":
+        try:
+            hours = float(text)
+            start_time = (datetime.now() + timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M")
+            context.user_data["start_time"] = start_time
+        except ValueError:
+            await update.message.reply_text("Введи число, например: 2")
+            return AWAIT_TIME_VALUE
     else:
-        await update.message.reply_text("Отменено.")
-        return ConversationHandler.END
+        context.user_data["start_time"] = text
+
+    return await confirm_and_queue(update, context)
 
 
-async def handle_confirm_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Оператор подтверждает или отклоняет предложенную Мефодием цель."""
-    if not is_operator(update):
+async def confirm_and_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Подтверждает и добавляет в очередь."""
+    goal = context.user_data["pending_goal"]
+    source = context.user_data.get("pending_source", "operator")
+    start_time = context.user_data.get("start_time")
+
+    # Добавляем в очередь
+    data = read_queue()
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data["queue"].append({
+        "goal": goal,
+        "source": source,
+        "status": "approved" if start_time else "approved",
+        "start_time": start_time,
+        "proposed_at": timestamp
+    })
+    write_queue(data)
+
+    time_label = f"в {start_time}" if start_time else "сразу"
+    await update.message.reply_text(
+        f"✅ Добавлено в очередь\n\nЗапуск: {time_label}",
+        reply_markup=ReplyKeyboardRemove()
+    )
+
+    # Если сразу — запускаем
+    if not start_time:
+        gen_num = get_next_generation_num()
+        remove_item(timestamp)
+        await start_generation(goal, gen_num, update.get_bot() or context.application)
+
+    return ConversationHandler.END
+
+
+async def handle_approval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обрабатывает ответ оператора на предложение из очереди."""
+    if update.effective_chat.id != OPERATOR_CHAT_ID:
         return
 
     text = update.message.text
+    data = read_queue()
 
-    if text == "✅ Принять цель":
-        keyboard = [["▶️ Сразу", "⏰ Указать время"]]
+    # Находим элемент ожидающий ответа оператора
+    awaiting = next(
+        (i for i in data["queue"] if i["status"] == "awaiting_operator"),
+        None
+    )
+
+    if not awaiting:
+        return
+
+    if text == "✅ Принять":
+        keyboard = [["▶️ Сразу", "⏰ Через N часов", "📅 В конкретное время"]]
         markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
-        await update.message.reply_text(
-            "Цель принята. Когда запустить?",
-            reply_markup=markup
-        )
+        context.user_data["pending_goal"] = awaiting["goal"]
+        context.user_data["pending_source"] = awaiting["source"]
+        context.user_data["pending_proposed_at"] = awaiting["proposed_at"]
+        remove_item(awaiting["proposed_at"])
+        await update.message.reply_text("Когда запустить?", reply_markup=markup)
         return AWAIT_TIME
 
-    elif text == "✏️ Изменить цель":
-        await update.message.reply_text("Введи новую формулировку цели:")
-        return AWAIT_GOAL_CONFIRM
-
-    else:
-        context.user_data["new_goal"] = text
-        pending["goal"] = text
-        keyboard = [["▶️ Сразу", "⏰ Указать время"]]
-        markup = ReplyKeyboardMarkup(keyboard, one_time_keyboard=True, resize_keyboard=True)
+    elif text == "✏️ Изменить":
+        context.user_data["pending_proposed_at"] = awaiting["proposed_at"]
+        remove_item(awaiting["proposed_at"])
         await update.message.reply_text(
-            f"Цель обновлена:\n_{text}_\n\nКогда запустить?",
+            f"Текущая цель:\n_{awaiting['goal'][:300]}_\n\nВведи новую формулировку:",
             parse_mode="Markdown",
-            reply_markup=markup
+            reply_markup=ReplyKeyboardRemove()
         )
-        return AWAIT_TIME
+        return AWAIT_GOAL
+
+    elif text == "❌ Отклонить":
+        remove_item(awaiting["proposed_at"])
+        await update.message.reply_text(
+            "Цель отклонена.",
+            reply_markup=ReplyKeyboardRemove()
+        )
 
 
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Отменяет текущий диалог."""
-    await update.message.reply_text("Отменено.")
+    await update.message.reply_text("Отменено.", reply_markup=ReplyKeyboardRemove())
     return ConversationHandler.END
 
 
-def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+# --- Watchdog для loop.sh ---
 
-    # Conversation handler для согласования цели и времени
+async def watchdog(app: Application):
+    """
+    Проверяет не завис ли текущий цикл агента.
+    Если loop.sh не запущен а поколение не завершено — рестартует.
+    """
+    while True:
+        await asyncio.sleep(300)  # проверяем каждые 5 минут
+        try:
+            gen_dir = get_current_generation_dir()
+            if not gen_dir:
+                continue
+
+            # Если loop.sh не запущен
+            if is_generation_running():
+                continue
+
+            # Проверяем есть ли незакрытые задачи
+            todo_text = (gen_dir / "TODO.md").read_text() if (gen_dir / "TODO.md").exists() else ""
+            open_tasks = todo_text.count("- [ ]")
+
+            if open_tasks > 0:
+                logger.warning("Watchdog: loop.sh не запущен, есть открытые задачи — рестарт")
+                log_file = gen_dir / ".runtime" / "loop.log"
+                subprocess.Popen(
+                    ["bash", "loop.sh"],
+                    cwd=str(gen_dir),
+                    stdout=open(log_file, "a"),
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True
+                )
+                await app.bot.send_message(
+                    chat_id=OPERATOR_CHAT_ID,
+                    text="⚠️ Watchdog: Мефодий завис, перезапустил цикл."
+                )
+        except Exception as e:
+            logger.error(f"Watchdog ошибка: {e}")
+
+
+# --- Планировщик запусков ---
+
+async def scheduler(app: Application):
+    """Проверяет запланированные запуски и стартует их вовремя."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            data = read_queue()
+            now = datetime.now()
+
+            for item in data["queue"]:
+                if item["status"] != "approved" or not item.get("start_time"):
+                    continue
+                try:
+                    start_dt = datetime.strptime(item["start_time"], "%Y-%m-%d %H:%M")
+                    if now >= start_dt:
+                        gen_num = get_next_generation_num()
+                        remove_item(item["proposed_at"])
+                        await start_generation(item["goal"], gen_num, app)
+                        logger.info(f"Планировщик запустил поколение {gen_num}")
+                except ValueError:
+                    pass
+        except Exception as e:
+            logger.error(f"Планировщик ошибка: {e}")
+
+
+def main():
+    request = HTTPXRequest(read_timeout=30, connect_timeout=30, write_timeout=30)
+    app = Application.builder().token(BOT_TOKEN).request(request).build()
+
+    # Conversation handler
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("new_goal", cmd_new_goal),
             MessageHandler(
-                filters.TEXT & filters.Regex("^(✅ Принять цель|✏️ Изменить цель)$"),
-                handle_confirm_goal
+                filters.TEXT & filters.Regex("^(✅ Принять|✏️ Изменить|❌ Отклонить)$"),
+                handle_approval
             )
         ],
         states={
-            AWAIT_GOAL_CONFIRM: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_goal)
-            ],
-            AWAIT_TIME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, receive_time)
-            ],
-            AWAIT_TIME_CONFIRM: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_time)
-            ],
+            AWAIT_GOAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_new_goal)],
+            AWAIT_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_time_choice)],
+            AWAIT_TIME_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_time_value)],
         },
         fallbacks=[CommandHandler("cancel", cmd_cancel)],
     )
 
     app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("queue", cmd_queue))
+
+    # Фоновые задачи
+    app.job_queue.run_repeating(
+        lambda ctx: asyncio.ensure_future(check_queue(app)),
+        interval=QUEUE_CHECK_INTERVAL,
+        first=10
+    )
+    app.job_queue.run_repeating(
+        lambda ctx: asyncio.ensure_future(scheduler(app)),
+        interval=60,
+        first=15
+    )
+    app.job_queue.run_repeating(
+        lambda ctx: asyncio.ensure_future(watchdog(app)),
+        interval=300,
+        first=30
+    )
 
     logger.info("Мефодий-бот запущен. Слушаю оператора...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

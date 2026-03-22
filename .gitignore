@@ -21,4 +21,4 @@ Thumbs.db
 PROJECT_CONTEXT.md
 
 # Claude Code
-.claude/
+.claude/.generation_queue.json
