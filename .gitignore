@@ -1,6 +1,12 @@
 # Runtime директории агента
 generation_*/.runtime/
 
+# Очередь поколений
+.generation_queue.json
+
+# Claude Code
+.claude/
+
 # Бэкапы
 *.bak
 
@@ -19,9 +25,3 @@ Thumbs.db
 
 # Dev
 PROJECT_CONTEXT.md
-
-# Claude Code
-.claude/.generation_queue.json
-.generation_queue.json
-.generation_queue.lock
-.claude/
