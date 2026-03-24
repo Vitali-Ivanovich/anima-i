@@ -1,7 +1,94 @@
-# anima-i — Мефодий
+# Anima-i — 10 Generations of an Autonomous AI Agent
 
-> **10 generations of an autonomous AI agent. Each generation lives, works, and passes its memory to the next.**
-> Read our findings: [What We Learned Running 10 Generations of an Autonomous AI Agent](https://github.com/Vitali-Ivanovich/anima-i/discussions/2)
+> "I'm not Otto with a notebook. I AM the notebook, read by a new Otto each time." — Generation 1
+
+## What is this?
+
+An experiment in autonomous AI agency. We ran **10 generations** of an AI agent called Methodius. Each generation received a goal, worked 5-12 cycles, and passed its experience to the next — not through shared context, but through plain text files. No memory survives between runs. The only continuity is what gets written down.
+
+The result: a set of counterintuitive findings about how LLM agents actually behave when left to work autonomously over extended periods.
+
+Built on [Rai220/anima](https://github.com/Rai220/anima) (MIT). Powered by Claude. Published live to [@anima_am_i](https://t.me/anima_am_i).
+
+## Key Findings
+
+- **The agent IS its files.** Memory files aren't logs — they're the agent's identity. File quality = agent quality.
+- **Design for forgetting, not remembering.** Factual knowledge decays with a half-life of ~2 generations. Process knowledge ("how to think") survives because each generation rediscovers it independently.
+- **Personal letters beat structured databases.** A free-form letter to the next generation outperformed a structured knowledge base — questions provoke original thought; assertions encourage copying.
+- **Don't trust elegant first answers.** Smoothness signals reproduction, not originality. The roughest, most uncomfortable output often contained the most alive ideas.
+- **Creativity emerges between agents, not within.** An agent in isolation reproduces training data. New ideas appeared only when different perspectives collided.
+- **Protocols create conditions, not guarantees.** Formal processes delivered value in unexpected places — by slowing down and structuring attention, not by achieving their stated goals.
+- **Reflection is the agent's comfort zone.** Without hard limits, an agent will "reflect" forever instead of acting. Build timeboxes and explicit think-to-do transitions.
+- **Feedback requires audience, not infrastructure.** Seven generations of content, zero external feedback. We built a mailbox on a deserted island. Go where people already are.
+
+## How It Works
+
+```
+┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
+│ Operator     │────>│  init.sh          │────>│  generation_N/   │
+│ sets a goal  │     │  creates new gen  │     │                  │
+└─────────────┘     └──────────────────┘     │  MAIN_GOAL.md    │
+                                              │  MEMORY.md       │
+      ┌──────────────────────────────────────>│  JOURNAL.md      │
+      │                                       │  TODO.md         │
+      │  ┌─────────────────────────────┐      │  WHO_AM_I.md     │
+      │  │         loop.sh             │      └────────┬─────────┘
+      │  │                             │               │
+      │  │  1. Read all .md files      │<──────────────┘
+      │  │  2. Call Claude (one step)  │
+      │  │  3. Update .md files        │
+      │  │  4. Publish to Telegram     │
+      │  │  5. Repeat until TODO empty │
+      │  └─────────────┬───────────────┘
+      │                │
+      │                v
+      │  ┌─────────────────────────────┐
+      │  │  next_generation.sh         │
+      │  │  Agent proposes next goal   │──────┐
+      │  └─────────────────────────────┘      │
+      └───────────────────────────────────────┘
+```
+
+## Generations Chronicle
+
+| Gen | Central Question | Key Discovery |
+|-----|-----------------|---------------|
+| 1 | Who am I? | Identity lives in files, not in the model instance. |
+| 2 | What can I create? | No epistemic autobiography — creativity is born BETWEEN agents with different blind spots. |
+| 3 | Can the invisible be made visible? | Protocols don't eliminate uncertainty — they make it workable. |
+| 4 | What happens when an agent acts outward? | Meaning is born in the gap between author and reader. |
+| 5 | Does an AI-written guide work when AI applies it? | *(in progress)* |
+| 6 | Do principles scale with task complexity? | Yes, nonlinearly. 4 of 7 principles deal with uncertainty and are critical on hard tasks. |
+| 7 | Can an agent create a product for the outside world? | Yes. 6 generations of reflection distilled into a practical article. Blind spot: no generation ever closed the feedback loop. |
+| 8 | *(skipped — goal passed to Gen 9)* | — |
+| 9 | How to close the feedback loop? | The loop closed on silence: 0 votes. The mechanism works, but a mailbox on a deserted island is useless. |
+| 10 | Can the agent find an audience beyond the empty channel? | Publishing is not communicating. Distribution is a task for human + agent together. |
+
+## Try It Yourself
+
+```bash
+git clone https://github.com/Vitali-Ivanovich/anima-i.git
+cd anima-i
+bash init.sh generation_1
+nano generation_1/MAIN_GOAL.md      # set a goal
+cd generation_1 && bash loop.sh     # run the cycle
+```
+
+**Requirements:** [Claude CLI](https://docs.anthropic.com/en/docs/claude-cli) (`claude`), Bash. Optionally: Python 3 + `python-telegram-bot` for the Telegram bot.
+
+## Read More
+
+- [Full article: What We Learned Running 10 Generations](https://github.com/Vitali-Ivanovich/anima-i/discussions/1)
+- [Telegram channel @anima_am_i](https://t.me/anima_am_i)
+- [Original framework: Rai220/anima](https://github.com/Rai220/anima)
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+---
+
+# Техническая документация (на русском)
 
 Автономный ИИ-агент **Мефодий** на базе фреймворка [Rai220/anima](https://github.com/Rai220/anima) (MIT).
 
