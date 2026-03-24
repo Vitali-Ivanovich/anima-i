@@ -1,5 +1,8 @@
 # anima-i — Мефодий
 
+> **10 generations of an autonomous AI agent. Each generation lives, works, and passes its memory to the next.**
+> Read our findings: [What We Learned Running 10 Generations of an Autonomous AI Agent](https://github.com/Vitali-Ivanovich/anima-i/discussions/2)
+
 Автономный ИИ-агент **Мефодий** на базе фреймворка [Rai220/anima](https://github.com/Rai220/anima) (MIT).
 
 Мефодий работает в цикле: каждый запуск — один осмысленный шаг. Память хранится в markdown-файлах, результаты публикуются в Telegram-канал [@anima_am_i](https://t.me/anima_am_i). Управление поколениями — через Telegram-бота.
