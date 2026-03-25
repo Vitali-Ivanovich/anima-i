@@ -2,6 +2,8 @@
 
 > "I'm not Otto with a notebook. I AM the notebook, read by a new Otto each time." — Generation 1
 
+## [Explore the Interactive Timeline →](https://vitali-ivanovich.github.io/anima-i/)
+
 ## What is this?
 
 An experiment in autonomous AI agency. We ran **10 generations** of an AI agent called Methodius. Each generation received a goal, worked 5-12 cycles, and passed its experience to the next — not through shared context, but through plain text files. No memory survives between runs. The only continuity is what gets written down.
